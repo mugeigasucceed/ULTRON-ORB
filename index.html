@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orb</title>
+<style>
+  :root { --bg:#07090d; --ember:#ff5a3c; --pale:#ffd9b0; --dim:#7d8795; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--pale);
+    font-family: "Trebuchet MS", "Segoe UI", sans-serif; overflow:hidden; }
+  canvas#c { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  #panel { position:fixed; left:20px; bottom:20px; max-width:300px; line-height:1.45; font-size:14px; }
+  #panel h1 { font-size:18px; margin:0 0 6px; font-weight:600; letter-spacing:.02em; }
+  #status { color:var(--dim); margin:0 0 12px; min-height:2.9em; }
+  button { background:var(--ember); color:#1a0904; border:0; padding:10px 18px; font-size:15px;
+    font-weight:700; border-radius:3px; cursor:pointer; }
+  button:focus-visible { outline:2px solid var(--pale); outline-offset:3px; }
+  button[disabled] { opacity:.5; cursor:default; }
+  #dot { position:fixed; top:16px; right:16px; width:8px; height:8px; border-radius:50%; background:var(--ember); opacity:0; transition:opacity .15s; }
+  #cam { position:fixed; right:0; bottom:0; width:160px; opacity:0; pointer-events:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="dot"></div>
+<div id="panel">
+  <p id="status"></p>
+  <button id="start">Start camera</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+<script>
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+camera.position.z = 5;
+
+// ---- The orb: a cloud of points + a wireframe shell + two rings ----
+const orb = new THREE.Group();
+scene.add(orb);
+
+const N = 1600, pos = new Float32Array(N * 3), golden = Math.PI * (3 - Math.sqrt(5));
+for (let i = 0; i < N; i++) {
+  const y = 1 - (i / (N - 1)) * 2, r = Math.sqrt(1 - y * y), t = golden * i;
+  pos.set([Math.cos(t) * r * 1.4, y * 1.4, Math.sin(t) * r * 1.4], i * 3);
+}
+const pg = new THREE.BufferGeometry();
+pg.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+orb.add(new THREE.Points(pg, new THREE.PointsMaterial({ color:0xffd9b0, size:0.03, transparent:true, opacity:.9 })));
+
+orb.add(new THREE.Mesh(new THREE.IcosahedronGeometry(1.25, 2),
+  new THREE.MeshBasicMaterial({ color:0xff5a3c, wireframe:true, transparent:true, opacity:.35 })));
+
+const ringMat = new THREE.MeshBasicMaterial({ color:0xff5a3c, transparent:true, opacity:.7 });
+const ring1 = new THREE.Mesh(new THREE.TorusGeometry(1.8, 0.008, 8, 128), ringMat);
+const ring2 = ring1.clone(); ring2.rotation.x = Math.PI / 2; ring2.scale.setScalar(0.88);
+orb.add(ring1, ring2);
+
+// ---- Targets that the hand (or mouse) controls ----
+let targetRotX = 0, targetRotY = 0, targetScale = 1, handSeen = false;
+
+// Mouse fallback
+let dragging = false, lx = 0, ly = 0;
+addEventListener('pointerdown', e => { dragging = true; lx = e.clientX; ly = e.clientY; });
+addEventListener('pointerup', () => dragging = false);
+addEventListener('pointermove', e => {
+  if (!dragging || handSeen) return;
+  targetRotY += (e.clientX - lx) * 0.01; targetRotX += (e.clientY - ly) * 0.01;
+  lx = e.clientX; ly = e.clientY;
+});
+addEventListener('wheel', e => {
+  if (handSeen) return;
+  targetScale = Math.min(2, Math.max(0.5, targetScale - e.deltaY * 0.001));
+});
+
+// ---- Render loop ----
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+(function loop(t) {
+  requestAnimationFrame(loop);
+  orb.rotation.x += (targetRotX - orb.rotation.x) * 0.3;
+  orb.rotation.y += (targetRotY - orb.rotation.y) * 0.3;
+  const s = orb.scale.x + (targetScale - orb.scale.x) * 0.3;
+  orb.scale.setScalar(s);
+  if (!reduce) { ring1.rotation.z += 0.004; ring2.rotation.y += 0.006; }
+  renderer.render(scene, camera);
+})(0);
+
+// ---- Hand tracking ----
+const video = document.getElementById('cam');
+const statusEl = document.getElementById('status');
+const btn = document.getElementById('start');
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+let prev = null, sx = null, sy = null, pinchS = 0.5;
+const dot = document.getElementById('dot');
+function onResults(res) {
+  document.getElementById('panel').style.display = 'none';
+  const lm = res.multiHandLandmarks && res.multiHandLandmarks[0];
+  if (!lm) { handSeen = false; prev = null; dot.style.opacity = 0.15; return; }
+  handSeen = true; dot.style.opacity = 1;
+
+  // Smooth the hand position a little so the orb is steady but still quick
+  const rx = 1 - lm[9].x, ry = lm[9].y;
+  sx = sx === null ? rx : sx + (rx - sx) * 0.6;
+  sy = sy === null ? ry : sy + (ry - sy) * 0.6;
+
+  // Rotation follows how far your hand MOVED since the last frame
+  if (prev) {
+    const dx = sx - prev.x, dy = sy - prev.y;
+    if (Math.abs(dx) > 0.0015) targetRotY += dx * 7;
+    if (Math.abs(dy) > 0.0015) targetRotX += dy * 5;
+  }
+  prev = { x: sx, y: sy };
+
+  // Zoom: thumb-to-index gap compared with palm size (closed ~0.1, wide open ~0.9)
+  const ratio = dist(lm[4], lm[8]) / dist(lm[0], lm[9]);
+  const t = Math.min(1, Math.max(0, (ratio - 0.12) / 0.75));
+  pinchS += (t - pinchS) * 0.5;
+  targetScale = 0.45 + pinchS * 1.85;
+}
+
+btn.addEventListener('click', async () => {
+  btn.disabled = true; btn.textContent = 'Starting...'; statusEl.textContent = '';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:640, height:480 } });
+    video.srcObject = stream; await video.play();
+  } catch (e) {
+    statusEl.textContent = 'Camera blocked or not found (' + e.name + '). Mouse drag and wheel still work.';
+    btn.disabled = false; btn.textContent = 'Start camera'; return;
+  }
+  const hands = new Hands({ locateFile: f => 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/' + f });
+  hands.setOptions({ maxNumHands:1, modelComplexity:0, minDetectionConfidence:0.6, minTrackingConfidence:0.5 });
+  hands.onResults(onResults);
+  let busy = false;
+  (async function feed() {
+    if (!busy && video.readyState >= 2) { busy = true; try { await hands.send({ image: video }); } catch (e) {} busy = false; }
+    requestAnimationFrame(feed);
+  })();
+  btn.textContent = 'Camera on';
+});
+</script>
+</body>
+</html>
